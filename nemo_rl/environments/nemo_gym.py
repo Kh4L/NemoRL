@@ -277,8 +277,14 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config.policy["generation"]
 
     # Enable the http server. Requires both async engine and the expose_http_server flag
-    generation_config["vllm_cfg"]["async_engine"] = True
-    generation_config["vllm_cfg"]["expose_http_server"] = True
+    backend = generation_config.get("backend", "vllm")
+    if backend == "vllm":
+        generation_config["vllm_cfg"]["async_engine"] = True
+        generation_config["vllm_cfg"]["expose_http_server"] = True
+    elif backend == "sglang":
+        pass  # SGLang always launches the OpenAI HTTP server per engine
+    else:
+        raise ValueError(f"NeMo-Gym supports vllm/sglang backends, got {backend!r}")
 
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None

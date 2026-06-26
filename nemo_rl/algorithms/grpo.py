@@ -69,7 +69,8 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
-from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
+from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -593,7 +594,9 @@ def setup(
             processor=processor,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
-            init_optimizer=True,
+            # gen_benchmark_skip_training: pure generation benchmark, no real training
+            # -> don't build the optimizer (saves memory/time; refit needs only weights).
+            init_optimizer=not grpo_config.get("gen_benchmark_skip_training", False),
             init_reference_model=init_reference_model,
         )
         return p, time.perf_counter() - t0
@@ -608,7 +611,7 @@ def setup(
     def init_sglang():
         """Initialize SGLang generation workers."""
         t0 = time.perf_counter()
-        pg = SGLangGeneration(cluster=inference_cluster, config=generation_config)
+        pg = SGLangGeneration(cluster=inference_cluster, sglang_cfg=generation_config)
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
@@ -753,8 +756,11 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    # if it is not colocated inference, initialize collective communication for update weights.
+    # SGLang owns its own weight-update process group (set up lazily on the
+    # first refit through ``connect_sglang_rollout_engines_distributed``), so
+    # skip the legacy trainer/vLLM init_collective handshake for SGLang.
+    if not colocated_inference and not isinstance(policy_generation, SGLangGeneration):
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -772,6 +778,18 @@ def setup(
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+
+    if backend == "sglang" and isinstance(policy_generation, SGLangGeneration):
+        weight_transfer_mode = generation_config["sglang_server"].get(
+            "weight_transfer_mode", "ipc" if colocated_inference else "broadcast"
+        )
+        expected = "ipc" if colocated_inference else "broadcast"
+        if weight_transfer_mode != expected:
+            raise ValueError(
+                f"sglang_server.weight_transfer_mode={weight_transfer_mode!r} "
+                f"is inconsistent with colocated.enabled={colocated_inference}: "
+                f"expected {expected!r}."
+            )
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
@@ -1005,6 +1023,39 @@ def scale_rewards(
     return repeated_batch
 
 
+def extract_initial_prompt_messages(
+    message_logs: list,
+    original_prompt_lengths: torch.Tensor,
+) -> list:
+    """Extract the original prompt messages from message logs using token length.
+
+    This function correctly identifies original prompt messages even when the prompt
+    contains assistant messages (e.g., multi-turn conversation history).
+
+    Args:
+        message_logs: List of message logs, where each log is a list of messages.
+        original_prompt_lengths: Tensor of original prompt token lengths per sample.
+
+    Returns:
+        List of message logs containing only the original prompt messages.
+    """
+    initial_prompt_message_logs = []
+    for i, message_log in enumerate(message_logs):
+        initial_prompt_log = []
+        cumulative_length = 0
+        target_length = original_prompt_lengths[i].item()
+
+        for message in message_log:
+            if cumulative_length >= target_length:
+                break
+            initial_prompt_log.append(message)
+            cumulative_length += len(message["token_ids"])
+
+        initial_prompt_message_logs.append(initial_prompt_log)
+
+    return initial_prompt_message_logs
+
+
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
@@ -1015,6 +1066,8 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
         return False
 
     backend = generation_config.get("backend", "")
+    if backend == "sglang":
+        return True  # SWE2 SGLang runs async non-colocated
     if backend != "vllm":
         return False
 
@@ -1036,6 +1089,8 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
 
     # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
     generation_config = master_config.policy["generation"]
+    if generation_config.get("backend") == "sglang":
+        return should_use_nemo_gym  # SGLang always exposes the OpenAI HTTP server
     should_expose_http_server = generation_config["vllm_cfg"].get("expose_http_server")
     assert should_expose_http_server, (
         "In order to use NeMo-Gym, you must expose the vllm server via `expose_http_server: true`!"
@@ -1101,26 +1156,42 @@ def _create_advantage_estimator(master_config: MasterConfig):
     return adv_estimator
 
 
-def _extract_prompt_only_messages(message_logs: list) -> list:
-    """Extract only prompt messages (user/system) from message logs.
+def _refit_sglang_dispatch(
+    *,
+    policy: ColocatablePolicyInterface,
+    policy_generation: SGLangGeneration,
+    buffer_size_bytes: int,
+    mode: str,
+) -> bool:
+    """Route an SGLang refit to the backend-specific helper.
 
-    This is used to get prompt IDs for advantage estimation, excluding
-    any assistant responses.
+    Backend-specific lifecycle (lock + pause/flush + send + post_process +
+    continue) lives in the corresponding worker module:
 
-    Args:
-        message_logs: List of message logs, where each log is a list of messages.
+    - ``megatron_policy_worker.refit_sglang_{colocated,distributed}``
+    - ``dtensor_policy_worker_v2.refit_sglang_{colocated,distributed}``
 
-    Returns:
-        List of message logs containing only user and system messages.
+    so this function only picks the right module by trainer backend and
+    transfer mode.
     """
-    prompt_only_message_logs = []
-    for message_log in message_logs:
-        prompt_only_log = []
-        for message in message_log:
-            if message["role"] == "user" or message["role"] == "system":
-                prompt_only_log.append(message)
-        prompt_only_message_logs.append(prompt_only_log)
-    return prompt_only_message_logs
+    use_megatron = bool(policy.cfg.get("megatron_cfg", {}).get("enabled", False))
+    if use_megatron:
+        from nemo_rl.models.policy.workers import megatron_policy_worker as _backend
+    else:
+        from nemo_rl.models.policy.workers import dtensor_policy_worker_v2 as _backend
+
+    if mode == "ipc":
+        helper = _backend.refit_sglang_colocated
+    elif mode == "broadcast":
+        helper = _backend.refit_sglang_distributed
+    else:
+        raise ValueError(f"unknown SGLang weight_transfer_mode: {mode!r}")
+
+    return helper(
+        policy=policy,
+        policy_generation=policy_generation,
+        buffer_size_bytes=buffer_size_bytes,
+    )
 
 
 def refit_policy_generation(
@@ -1155,18 +1226,19 @@ def refit_policy_generation(
     with timer_context:
         # update weights
         update_success = False
-        if colocated_inference:
-            # get model param keys, which is grouped by size
-            if _refit_buffer_size_gb is not None:
-                buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
-            else:
-                # Empirically sets ratio as 30% to maximize efficiency.
-                # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
-                memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
-                buffer_size_bytes = int(
-                    policy.get_free_memory_bytes() * float(memory_ratio)
-                )
+        # Compute the refit buffer size before the colocated/non-colocated
+        # split so both branches (e.g. the SGLang broadcast dispatch) have it.
+        if _refit_buffer_size_gb is not None:
+            buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
+        else:
+            # Empirically sets ratio as 30% to maximize efficiency.
+            # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
+            memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
+            buffer_size_bytes = int(
+                policy.get_free_memory_bytes() * float(memory_ratio)
+            )
 
+        if colocated_inference:
             if isinstance(policy_generation, SGLangGeneration):
                 sglang_url_to_gpu_uuids = (
                     policy_generation.get_sglang_url_to_gpu_uuids()
@@ -1193,17 +1265,22 @@ def refit_policy_generation(
                 update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl
-            # SGLang haven't implemented non-colocated inference mode.
             if isinstance(policy_generation, SGLangGeneration):
-                raise NotImplementedError(
-                    "SGLang haven't implemented non-colocated inference mode. "
+                update_success = _refit_sglang_dispatch(
+                    policy=policy,
+                    policy_generation=policy_generation,
+                    buffer_size_bytes=buffer_size_bytes,
+                    mode="broadcast",
                 )
-            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
-            futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
+            else:
+                futures_train = policy.broadcast_weights_for_collective(
+                    kv_scales=kv_scales
+                )
+                futures_inference = policy_generation.update_weights_from_collective()
+                # wait for all futures to complete
+                ray.get(futures_train)
+                results = ray.get(futures_inference)
+                update_success = all(result for result in results if result is not None)
 
         # check if update is successful
         if not update_success:
@@ -1676,16 +1753,20 @@ def grpo_train(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
-                    # Extract prompt-only messages for advantage estimation
-                    prompt_only_message_logs = _extract_prompt_only_messages(
-                        repeated_batch["message_log"]
+                    # Extract original prompt messages using the length field
+                    # This correctly handles multi-turn prompts that contain assistant messages
+                    initial_prompt_message_logs = extract_initial_prompt_messages(
+                        repeated_batch["message_log"],
+                        repeated_batch["length"],
                     )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        prompt_only_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                    prompt_batched_flat, prompt_input_lengths = (
+                        batched_message_log_to_flat_message(
+                            initial_prompt_message_logs,
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        )
                     )
                     prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del prompt_only_message_logs
+                    del initial_prompt_message_logs
                     del prompt_batched_flat
                     del input_ids
                     del baseline
@@ -2481,6 +2562,21 @@ def async_grpo_train(
     POLICY_GENERATION_STALE = True
     assert policy_generation is not None
 
+    # Benchmark-only: skip real training (no fwd/bwd, no optimizer) while still
+    # refitting the (unchanged) weights every step. Keeps the generation pipeline /
+    # weight-sync cadence realistic for a pure generation scaling benchmark.
+    SKIP_TRAINING_BENCHMARK = master_config.grpo.get(
+        "gen_benchmark_skip_training", False
+    )
+    if SKIP_TRAINING_BENCHMARK:
+        print(
+            "⚠️ gen_benchmark_skip_training=True: policy.train() is a no-op; "
+            "weights are frozen and refit every step (generation benchmark mode)."
+        )
+        # Keep training GPUs non-idle so the idle-GPU reaper does not kill the job.
+        if hasattr(policy, "start_gen_benchmark_keepalive"):
+            policy.start_gen_benchmark_keepalive()
+
     # Training state
     step = grpo_save_state["current_step"]
     weight_version = step  # Tracks refitted weight versions
@@ -2781,16 +2877,21 @@ def async_grpo_train(
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
-                    # Extract prompt-only messages for advantage estimation
-                    prompt_only_message_logs = _extract_prompt_only_messages(
-                        repeated_batch["message_log"]
+                    # Extract original prompt messages using the length field
+                    # This correctly handles multi-turn prompts that contain assistant messages
+                    initial_prompt_message_logs = extract_initial_prompt_messages(
+                        repeated_batch["message_log"],
+                        repeated_batch["length"],
                     )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        prompt_only_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+
+                    prompt_batched_flat, prompt_input_lengths = (
+                        batched_message_log_to_flat_message(
+                            initial_prompt_message_logs,
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        )
                     )
                     prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del prompt_only_message_logs
+                    del initial_prompt_message_logs
                     del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
@@ -2933,11 +3034,31 @@ def async_grpo_train(
 
                 print("▶ Training policy...")
                 with timer.time("policy_training"):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    if SKIP_TRAINING_BENCHMARK:
+                        # No-op training: skip fwd/bwd/optimizer entirely. Weights are
+                        # left unchanged and refit as-is below. Still supply the metrics
+                        # the async loop indexes downstream — notably global_valid_toks,
+                        # used for token-throughput accounting (grpo.py refs metrics[
+                        # "global_valid_toks"]). Mirror real train()'s all_mb_metrics shape
+                        # (lists, mean-aggregated downstream).
+                        _valid_toks = int(train_data["token_mask"].sum().item())
+                        _valid_seqs = int(train_data["sample_mask"].sum().item())
+                        train_results = {
+                            "loss": torch.tensor(0.0),
+                            "grad_norm": torch.tensor(0.0),
+                            "all_mb_metrics": {
+                                "global_valid_toks": [_valid_toks],
+                                "global_valid_seqs": [_valid_seqs],
+                                # consumed by the per-step "Generation KL Error" print
+                                "gen_kl_error": [0.0],
+                            },
+                        }
+                    else:
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None

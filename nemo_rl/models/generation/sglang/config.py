@@ -17,6 +17,25 @@ from typing import Any, NotRequired, TypedDict
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
+class SglangQuantizationConfig(TypedDict, total=False):
+    """SGLang weight-precision config.
+
+    ``scheme="bf16"`` (or omitting the block) means BF16 rollout/refit. Set
+    ``scheme="mxfp8"`` to boot SGLang from an MXFP8 HF checkpoint and to send
+    MXFP8 HF tensors during online refit.
+    """
+
+    scheme: str  # "bf16" | "mxfp8"
+    weight_block_size: list[int]
+    scale_fmt: str
+    modules_to_not_convert: list[str]
+    extra_high_precision_layers_hf: list[str]
+    num_layers_at_start_in_bf16: int
+    num_layers_at_end_in_bf16: int
+    converted_model_path: str
+    cache_root: str
+
+
 class SglangSpecificArgs(TypedDict):
     """SGLang-specific configuration arguments.
 
@@ -25,7 +44,7 @@ class SglangSpecificArgs(TypedDict):
     """
 
     model_path: NotRequired[str]
-    gpus_per_server: NotRequired[int]
+    # Total number of gpus for rollout
     random_seed: NotRequired[int]
     skip_tokenizer_init: NotRequired[bool]
     disable_cuda_graph: NotRequired[bool]
@@ -42,6 +61,17 @@ class SglangSpecificArgs(TypedDict):
     enable_mixed_chunk: NotRequired[bool]
     enable_dp_attention: NotRequired[bool]
     enable_ep_moe: NotRequired[bool]
+    # FP8 GEMM backend, e.g. {"auto", "cutlass", "triton", "flashinfer_trtllm"}.
+    fp8_gemm_runner_backend: NotRequired[str]
+    # MoE runner backend, e.g. {"auto", "deep_gemm", "triton", "cutlass"}.
+    moe_runner_backend: NotRequired[str]
+    # MoE all-to-all backend. Newer sglang forks replaced ``enable_ep_moe``
+    # with this single switch: one of {"none", "deepep", "mooncake", "mori",
+    # "ascend_fuseep", "flashinfer"}. Defaults to "none" upstream.
+    moe_a2a_backend: NotRequired[str]
+    # DeepEP routing mode (only meaningful when ``moe_a2a_backend == "deepep"``):
+    # one of {"auto", "normal", "low_latency"}.
+    deepep_mode: NotRequired[str]
     enable_torch_compile: NotRequired[bool]
     torch_compile_max_bs: NotRequired[int]
     cuda_graph_max_bs: NotRequired[int | None]
@@ -52,7 +82,6 @@ class SglangSpecificArgs(TypedDict):
     triton_attention_reduce_in_fp32: NotRequired[bool]
     triton_attention_num_kv_splits: NotRequired[int]
     num_continuous_decode_steps: NotRequired[int]
-    enable_memory_saver: NotRequired[bool]
     allow_auto_truncate: NotRequired[bool]
     attention_backend: NotRequired[str | None]
     enable_multimodal: NotRequired[bool]
@@ -93,10 +122,55 @@ class SglangSpecificArgs(TypedDict):
     enable_fast_load: NotRequired[bool]
     # Server warmup
     skip_server_warmup: NotRequired[bool]
+    # Fault tolerance
+    use_fault_tolerance: NotRequired[bool]
+    rollout_health_check_interval: NotRequired[int]
+    rollout_health_check_timeout: NotRequired[int]
+    rollout_health_check_first_wait: NotRequired[int]
+    # Weight precision and (when scheme=mxfp8) offline-conversion knobs.
+    quantization: NotRequired[SglangQuantizationConfig]
+    # Chat/serving controls forwarded to sglang ServerArgs (B4 glue for the gym chat path).
+    tool_call_parser: NotRequired[str | None]
+    reasoning_parser: NotRequired[str | None]
+    chat_template: NotRequired[str | None]
+    served_model_name: NotRequired[str | None]
+
+
+class SGLangServer(TypedDict):
+    # needs_offload true --> enable_memory_saver true
+    needs_offload: bool
+    # for testing purpose. memory_saver
+    cpu_weight_backup: bool
+    sglang_server_concurrency: int
+    # for pause/continue gen ("retract" or "kill"); required in YAML.
+    pause_generation_mode: str
+    # When true, refit bookends every weight update with a check_weights
+    # snapshot + reset (pre-refit) and compare (post-refit) to assert that
+    # streamed weights actually land on the engine.
+    check_weight_update_equal: NotRequired[bool]
+    # total num gpus for inference
+    num_gpus: NotRequired[int]
+    num_gpus_per_engine: NotRequired[int]
+    # "ipc" -> CUDA-IPC over the colocated SGLang HTTP server (default for
+    # colocated inference). "broadcast" -> NCCL broadcast over a shared
+    # weight-update group (used when SGLang engines run on disaggregate GPUs).
+    weight_transfer_mode: NotRequired[str]
+
+
+class SGLangRouter(TypedDict):
+    # When false, skip launching/using the sgl router (single-server, gym chat path).
+    enabled: NotRequired[bool]
+    sglang_router_ip: NotRequired[str]
+    sglang_router_port: NotRequired[int]
+    router_policy: NotRequired[str]
+    use_distributed_post: NotRequired[bool]
+    sglang_router_request_timeout_secs: NotRequired[int]
 
 
 class SGLangConfig(GenerationConfig):
     """Configuration for SGLang runtime."""
 
     sglang_cfg: SglangSpecificArgs
+    sglang_server: SGLangServer
+    sglang_router: SGLangRouter
     sglang_kwargs: NotRequired[dict[str, Any]]

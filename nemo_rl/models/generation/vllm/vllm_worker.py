@@ -668,6 +668,72 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         import vllm
 
         self.llm = vllm.LLM(**llm_kwargs)
+        try:
+            self._vllm_engine_teacher_force()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    def _vllm_engine_teacher_force(self):
+        import os, json, vllm
+        P = "/tmp/swe2_parity"
+        if not os.path.exists(os.path.join(P, "VLLM_ENGINE_TF_TRIGGER")):
+            return
+        try:
+            fd = os.open(os.path.join(P, "VLLM_ENGINE_TF.lock"), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+        except Exception:
+            return
+        dbg = os.path.join(P, "vllm_engine_tf.log")
+        def _log(m):
+            try:
+                with open(dbg, "a") as f:
+                    f.write(str(m) + "\n")
+            except Exception:
+                pass
+        try:
+            recs = [json.loads(l) for l in open(os.path.join(P, "rollouts_filtered.jsonl")) if l.strip()][:100]
+            SP = vllm.SamplingParams
+            _log("START n=%d" % len(recs))
+            with open(os.path.join(P, "forced_vllm.jsonl"), "w") as fo:
+                for i, rec in enumerate(recs):
+                    pids = rec["prompt_token_ids"]
+                    gids = rec["generation_token_ids"]
+                    if not gids:
+                        continue
+                    full = [int(x) for x in pids] + [int(x) for x in gids]
+                    L = len(pids)
+                    sp = SP(temperature=0.0, max_tokens=1, prompt_logprobs=20)
+                    out = self.llm.generate(prompts=[{"prompt_token_ids": full}], sampling_params=sp)[0]
+                    plp = out.prompt_logprobs or []
+                    forced = []
+                    for j, tid in enumerate(gids):
+                        tid = int(tid)
+                        pos = L + j
+                        entry = plp[pos] if pos < len(plp) else None
+                        if not entry:
+                            forced.append({"pos": j, "token_id": tid, "logprob": None, "top": [], "align_ok": False})
+                            continue
+                        lp = entry.get(tid)
+                        top = []
+                        for k, v in entry.items():
+                            try:
+                                top.append([float(v.logprob), int(k)])
+                            except Exception:
+                                pass
+                        forced.append({"pos": j, "token_id": tid,
+                                       "logprob": (float(lp.logprob) if lp is not None else None),
+                                       "top": top, "align_ok": lp is not None})
+                    fo.write(json.dumps({"backend": "vllm", "n_prompt": L, "n_gen": len(gids),
+                                         "forced": forced, "sampled_log_probs": rec.get("generation_log_probs")}) + "\n")
+                    fo.flush()
+                    _log("rec %d/%d n_gen=%d" % (i + 1, len(recs), len(gids)))
+            with open(os.path.join(P, "VLLM_ENGINE_TF_DONE"), "w") as f:
+                f.write("done")
+            _log("DONE")
+        except Exception:
+            import traceback
+            _log("FAIL " + traceback.format_exc()[:2000])
 
     def post_init(self):
         self.vllm_device_ids = self.report_device_id()

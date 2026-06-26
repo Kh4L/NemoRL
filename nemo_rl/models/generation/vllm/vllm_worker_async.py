@@ -290,6 +290,67 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
 
+    async def _vllm_engine_teacher_force_async(self):
+        import os, json, uuid, asyncio
+        P = "/tmp/swe2_parity"
+        try:
+            fd = os.open(os.path.join(P, "VLLM_ENGINE_TF.lock"), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+        except Exception:
+            return
+        dbg = os.path.join(P, "vllm_engine_tf.log")
+        def _log(m):
+            try:
+                with open(dbg, "a") as f:
+                    f.write(str(m) + "\n")
+            except Exception:
+                pass
+        try:
+            recs = [json.loads(l) for l in open(os.path.join(P, "rollouts_filtered16.jsonl")) if l.strip()][:100]
+            _log("START n=%d (post-refit, from generate_async)" % len(recs))
+            with open(os.path.join(P, "forced_vllm.jsonl"), "w") as fo:
+                for i, rec in enumerate(recs):
+                    pids = rec["prompt_token_ids"]
+                    gids = rec["generation_token_ids"]
+                    if not gids:
+                        continue
+                    full = [int(x) for x in pids] + [int(x) for x in gids]
+                    L = len(pids)
+                    sp = self.SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=8)
+                    gen = self.llm.generate(prompt={"prompt_token_ids": full}, sampling_params=sp, request_id=str(uuid.uuid4()))
+                    out = None
+                    async for ro in gen:
+                        out = ro
+                    plp = (out.prompt_logprobs if out is not None else None) or []
+                    forced = []
+                    for j, tid in enumerate(gids):
+                        tid = int(tid)
+                        pos = L + j
+                        entry = plp[pos] if pos < len(plp) else None
+                        if not entry:
+                            forced.append({"pos": j, "token_id": tid, "logprob": None, "top": [], "align_ok": False})
+                            continue
+                        lp = entry.get(tid)
+                        top = []
+                        for k, v in entry.items():
+                            try:
+                                top.append([float(v.logprob), int(k)])
+                            except Exception:
+                                pass
+                        forced.append({"pos": j, "token_id": tid,
+                                       "logprob": (float(lp.logprob) if lp is not None else None),
+                                       "top": top, "align_ok": lp is not None})
+                    fo.write(json.dumps({"backend": "vllm", "n_prompt": L, "n_gen": len(gids),
+                                         "forced": forced, "sampled_log_probs": rec.get("generation_log_probs")}) + "\n")
+                    fo.flush()
+                    _log("rec %d/%d n_gen=%d" % (i + 1, len(recs), len(gids)))
+            with open(os.path.join(P, "VLLM_ENGINE_TF_DONE"), "w") as f:
+                f.write("done")
+            _log("DONE")
+        except Exception:
+            import traceback
+            _log("FAIL " + traceback.format_exc()[:2000])
+
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
 
@@ -358,6 +419,28 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 return super().model_post_init(context)
 
         class NeMoRLOpenAIServingMixin:
+            @staticmethod
+            def _set_max_tokens(request, max_tokens: int) -> None:
+                """Set the request's max output tokens.
+
+                Mutates the request in place. Handles both max_completion_tokens (newer OpenAI API)
+                and max_tokens (deprecated but still supported by vLLM).
+                """
+                if request.max_completion_tokens is not None:
+                    request.max_completion_tokens = max_tokens
+                elif request.max_tokens is not None:
+                    request.max_tokens = max_tokens
+
+            def _clamp_max_tokens(
+                self, request, request_max_tokens: int, prompt_token_ids: list[int]
+            ) -> None:
+                """Clamp the request's max output tokens so that input + output <= max_model_len."""
+                remaining = max(
+                    0, self.model_config.max_model_len - len(prompt_token_ids)
+                )
+                max_tokens = min(request_max_tokens, remaining)
+                self._set_max_tokens(request, max_tokens)
+
             async def _preprocess_chat(
                 self,
                 request,
@@ -375,6 +458,18 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
                 # Deepcopy messages here since _preprocess_chat may be destructive.
                 messages_for_replace_prefix_tokens = deepcopy(messages)
+
+                # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
+                # the actual value will be set through _clamp_max_tokens later.
+                actual_request_max_tokens = None
+                if isinstance(request, NeMoRLChatCompletionRequest):
+                    actual_request_max_tokens = (
+                        request.max_completion_tokens or request.max_tokens
+                    )
+                    # If max_completion_tokens or max_tokens is not set, we don't need to do _clamp_max_tokens.
+                    # So we don't need to set the request's max output tokens to 1 here.
+                    if actual_request_max_tokens is not None:
+                        self._set_max_tokens(request, 1)
 
                 # res is (conversation, [engine_prompt])
                 try:
@@ -399,6 +494,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     raise
 
                 if request.required_prefix_token_ids is None:
+                    # Clamp the request's max output tokens so that input + output <= max_model_len.
+                    if actual_request_max_tokens is not None:
+                        self._clamp_max_tokens(
+                            request,
+                            actual_request_max_tokens,
+                            res[1][0]["prompt_token_ids"],
+                        )
                     return res
 
                 # Find the last assistant message
@@ -443,9 +545,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     "prompt_token_ids"
                 ]
 
-                engine_prompt = res[1][
-                    0
-                ]  # We need to modify engine_prompt.prompt_token_ids
+                # We need to modify engine_prompt.prompt_token_ids
+                engine_prompt = res[1][0]
 
                 final_prompt_token_ids = _replace_prefix_tokens(
                     tokenizer=self.renderer.tokenizer,
@@ -455,6 +556,14 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
+
+                # Clamp after prefix replacement since the prompt length may have changed.
+                if actual_request_max_tokens is not None:
+                    self._clamp_max_tokens(
+                        request,
+                        actual_request_max_tokens,
+                        final_prompt_token_ids,
+                    )
 
                 return res
 
@@ -703,6 +812,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             return
 
         verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
+
+        if not getattr(self, "_parity_tf_spawned", False):
+            import os as _os
+            if _os.path.exists("/tmp/swe2_parity/VLLM_ENGINE_TF_TRIGGER"):
+                self._parity_tf_spawned = True
+                import asyncio as _asyncio
+                _asyncio.create_task(self._vllm_engine_teacher_force_async())
 
         input_ids_batch = data["input_ids"]
         input_lengths_batch = data["input_lengths"]
@@ -1070,6 +1186,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     f"Error: Worker failed to update weights. Result: {worker_result}"
                 )
                 return False
+            if not getattr(self, "_parity_tf_spawned", False):
+                import os as _os
+                if _os.path.exists("/tmp/swe2_parity/VLLM_ENGINE_TF_TRIGGER"):
+                    self._parity_tf_spawned = True
+                    import asyncio as _asyncio
+                    _asyncio.create_task(self._vllm_engine_teacher_force_async())
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
@@ -1106,6 +1228,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     f"Error: Worker failed to update weights. Result: {worker_result}"
                 )
                 return False
+            if not getattr(self, "_parity_tf_spawned", False):
+                import os as _os
+                if _os.path.exists("/tmp/swe2_parity/VLLM_ENGINE_TF_TRIGGER"):
+                    self._parity_tf_spawned = True
+                    import asyncio as _asyncio
+                    _asyncio.create_task(self._vllm_engine_teacher_force_async())
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")

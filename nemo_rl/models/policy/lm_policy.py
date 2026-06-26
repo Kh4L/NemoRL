@@ -792,6 +792,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
         ray.get(futures)
 
+    def start_gen_benchmark_keepalive(self, *args: Any, **kwargs: Any) -> None:
+        """Benchmark-only: keep training GPUs non-idle while real training is skipped."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "start_gen_benchmark_keepalive"
+        )
+        ray.get(futures)
+
     def prepare_for_lp_inference(self, *args: Any, **kwargs: Any) -> None:
         futures = self.worker_group.run_all_workers_single_data(
             "prepare_for_lp_inference"
@@ -913,6 +920,74 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data(
             "stream_weights_via_http",
             sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+        )
+        return futures
+
+    def connect_sglang_rollout_engines(
+        self,
+        *,
+        engine_gpu_counts: list[int],
+        engine_gpu_offsets: Optional[list[int]] = None,
+    ) -> None:
+        """Set up the colocate Gloo gather topology for SGLang weight refit."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "connect_sglang_rollout_engines",
+            engine_gpu_counts=engine_gpu_counts,
+            engine_gpu_offsets=engine_gpu_offsets,
+        )
+        ray.get(futures)
+
+    def update_weights_to_sglang_colocated(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Send Megatron-restored HF tensors to colocated SGLang via Ray IPC."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "update_weights_to_sglang_colocated",
+            rollout_engines=rollout_engines,
+            buffer_size_bytes=buffer_size_bytes,
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
+        )
+        return futures
+
+    def connect_sglang_rollout_engines_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        engine_gpu_counts: list[int],
+        group_name: Optional[str] = None,
+    ) -> None:
+        """Bring up the trainer-rank-0 NCCL group for SGLang disaggregate refit."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "connect_sglang_rollout_engines_distributed",
+            rollout_engines=rollout_engines,
+            engine_gpu_counts=engine_gpu_counts,
+            group_name=group_name,
+        )
+        ray.get(futures)
+
+    def update_weights_to_sglang_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        rollout_engine_lock: ray.actor.ActorHandle,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Broadcast Megatron-restored HF tensors to SGLang via NCCL (rank 0 only)."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "update_weights_to_sglang_distributed",
+            rollout_engines=rollout_engines,
+            rollout_engine_lock=rollout_engine_lock,
+            buffer_size_bytes=buffer_size_bytes,
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
         )
         return futures
 

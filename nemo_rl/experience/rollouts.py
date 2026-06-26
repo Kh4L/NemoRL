@@ -146,9 +146,14 @@ async def generate_responses_async(
     # Check if this is vLLM with async_engine enabled
     use_async_generation = (
         hasattr(policy_generation, "cfg")
-        and "vllm_cfg" in policy_generation.cfg
-        and policy_generation.cfg["vllm_cfg"]["async_engine"]
         and hasattr(policy_generation, "generate_async")
+        and (
+            policy_generation.cfg.get("backend") == "sglang"
+            or (
+                "vllm_cfg" in policy_generation.cfg
+                and policy_generation.cfg["vllm_cfg"]["async_engine"]
+            )
+        )
     )
 
     assert use_async_generation, (
@@ -1113,7 +1118,7 @@ def run_async_nemo_gym_rollout(
     assert max_rollout_turns is None, (
         "`max_rollout_turns` is not supported in NeMo-Gym path!"
     )
-    engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+    engine_max_model_len = (policy_generation.cfg["sglang_cfg"]["context_length"] if policy_generation.cfg.get("backend") == "sglang" else policy_generation.cfg["vllm_cfg"]["max_model_len"])
     if max_seq_len is not None and max_seq_len > engine_max_model_len:
         warnings.warn(
             f"policy max_total_sequence_length ({max_seq_len}) is greater than the "
@@ -1143,15 +1148,15 @@ def run_async_nemo_gym_rollout(
         responses_create_params = row["responses_create_params"]
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
-        if generation_config["max_new_tokens"] is not None:
-            existing_max_output_tokens = responses_create_params.get(
-                "max_output_tokens"
-            )
-            responses_create_params["max_output_tokens"] = (
-                min(existing_max_output_tokens, generation_config["max_new_tokens"])
-                if existing_max_output_tokens is not None
-                else generation_config["max_new_tokens"]
-            )
+
+        # Configure max_output_tokens to respect the max_new_tokens setting.
+        # Will clamp max_output_tokens in vllm_worker_async.py so that input + output <= max_seq_len
+        existing_max_output_tokens = responses_create_params.get("max_output_tokens")
+        responses_create_params["max_output_tokens"] = (
+            min(existing_max_output_tokens, generation_config["max_new_tokens"])
+            if existing_max_output_tokens is not None
+            else generation_config["max_new_tokens"]
+        )
 
         row["_rowidx"] = rowidx
 
@@ -1175,7 +1180,7 @@ def run_async_nemo_gym_rollout(
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
-        max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+        max_total_tokens_per_sample = (policy_generation.cfg["sglang_cfg"]["context_length"] if policy_generation.cfg.get("backend") == "sglang" else policy_generation.cfg["vllm_cfg"]["max_model_len"])
         all_sample_metrics = [
             {
                 "total_reward": r["full_result"]["reward"],
