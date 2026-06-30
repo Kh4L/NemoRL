@@ -196,13 +196,21 @@ Depending on your data shape, you may want to change these values."""
             if "generation_token_ids" not in output_item_dict:
                 continue
 
-            assert (
+            if (
                 seen_token_ids
-                == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
-Seen token IDs: {seen_token_ids}
-Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
-"""
+                != output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
+            ):
+                # Resilience (SWE2-SGLang): a rare non-contiguous turn (tokenization /
+                # reasoning-strip splice edge case) would otherwise hard-crash the rollout
+                # task and stall the entire async step. Truncate the episode at the last
+                # contiguous turn (drop the corrupted tail) so the trajectory stays valid,
+                # analogous to overlong filtering. Logged for visibility.
+                print(
+                    "[nemo_gym][SWE2-SGLang] WARNING: non-contiguous turn; truncating "
+                    f"trajectory at {len(nemo_rl_message_log) // 2} turns "
+                    f"(seen={len(seen_token_ids)} toks); dropping corrupted tail."
+                )
+                break
 
             nemo_rl_message_log.append(
                 {
