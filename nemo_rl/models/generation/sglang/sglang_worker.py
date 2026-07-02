@@ -425,12 +425,26 @@ class SGLangGenerationWorker:
             payload,
         )
 
+    def _flush_cache_window_s(self) -> int:
+        """Retry window (seconds) for /flush_cache to report an empty queue.
+
+        /flush_cache only returns 200 once the engine has no pending requests,
+        so under high rollout concurrency the drain can legitimately exceed the
+        historical 60s window during refit. Configurable via the optional
+        ``sglang_server.flush_cache_timeout_s`` key; absent -> 60.
+        """
+        window = (self.sglang_cfg.get("sglang_server") or {}).get(
+            "flush_cache_timeout_s"
+        )
+        return int(window) if window else 60
+
     def flush_cache(self):
         """Flush the cache of the server."""
         if self.node_rank != 0:
             return
         # flush cache will not return status_code 200 when there are pending requests
-        for _ in range(60):
+        window_s = self._flush_cache_window_s()
+        for _ in range(window_s):
             try:
                 response = requests.get(f"{self.server_base_url}/flush_cache")
                 if response.status_code == 200:
@@ -440,11 +454,13 @@ class SGLangGenerationWorker:
             except Exception as e:
                 logger.info(f"Error flushing cache: {e}")
             # Pace retries on both non-200 and exception paths; otherwise the
-            # 60 iterations fly by in milliseconds and timeout before sglang
+            # iterations fly by in milliseconds and timeout before sglang
             # has a chance to drain its queue.
             time.sleep(1)
         else:
-            raise TimeoutError("Timeout while flushing cache.")
+            raise TimeoutError(
+                f"Timeout while flushing cache (queue not empty after {window_s}s)."
+            )
 
     def shutdown(self):
         from sglang.srt.utils import kill_process_tree
@@ -706,7 +722,8 @@ class SGLangGenerationWorker:
         if self.node_rank != 0:
             return True
         # flush cache will not return status_code 200 when there are pending requests
-        for _ in range(60):
+        window_s = self._flush_cache_window_s()
+        for _ in range(window_s):
             try:
                 response = requests.get(f"{self.server_base_url}/flush_cache")
                 if response.status_code == 200:
@@ -717,9 +734,11 @@ class SGLangGenerationWorker:
             except Exception as e:
                 logger.info(f"Error flushing cache: {e}")
             # Pace retries on both non-200 and exception paths; otherwise
-            # the 60 iterations fly by in milliseconds.
+            # the iterations fly by in milliseconds.
             time.sleep(1)
-        raise TimeoutError("Timeout while flushing cache.")
+        raise TimeoutError(
+            f"Timeout while flushing cache (queue not empty after {window_s}s)."
+        )
 
 
 # ----------------------------------------------------------------------------

@@ -155,6 +155,14 @@ class SGLangServer(TypedDict):
     # colocated inference). "broadcast" -> NCCL broadcast over a shared
     # weight-update group (used when SGLang engines run on disaggregate GPUs).
     weight_transfer_mode: NotRequired[str]
+    # Seconds to wait for the engine's /flush_cache to report an empty request
+    # queue (used by both the offload flush and the pre-refit KV invalidation;
+    # polled at 1s intervals). /flush_cache only returns 200 once no requests
+    # are pending, so under high rollout concurrency the queue can legitimately
+    # take longer than the historical 60s window to drain during refit. On
+    # expiry the flush raises TimeoutError (refit callers log and continue with
+    # a stale KV cache). Absent -> 60 (the historical window).
+    flush_cache_timeout_s: NotRequired[int]
 
 
 class SGLangRouter(TypedDict):
