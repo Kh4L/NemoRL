@@ -161,6 +161,36 @@ engine path (`…vllm_model.engine=sglang`).
 Success markers (same as the vLLM baseline): non-zero `train:total_reward/mean` from step ~1,
 logged Gym responses contain real `function_call` items, resolved rate climbs toward ~8%.
 
+## 5b. Expected results (convergence — validated end-to-end)
+
+The full R=32 baseline-shape run (16 nodes = 8 train + 8 gen, PPS=8, GBS=64, LR 1e-6, async
+age-1, from the SWE1 `step_230_hf` init) was run for **63 steps** as four ~4h walltime segments
+chained via checkpoint+resume (`save_period=5` + `checkpoint_must_save_by`; resubmit the same
+`EXP_SUFFIX` and NeMo-RL auto-resumes from the latest `step_*` checkpoint). All four segments
+completed cleanly. `train/total_reward/mean` (per-step values are noisy at PPS=8 — read the
+per-segment level):
+
+| Steps | level |
+|---|---|
+| 1–16 | ~0.10 |
+| 17–31 | ~0.19 |
+| 33–47 | ~0.22 |
+| 49–63 | ~0.22 |
+
+**Monotonic rise 0.10 → 0.22, then a double-confirmed plateau at ~0.22** (peak batches up to
+0.42–0.47): SGLang async-GRPO learns and saturates. For reference, the internal vLLM baseline of
+the same shape showed ~0.08 resolved from its first steps.
+
+Robustness notes at this scale (all handled in this branch):
+- **Over-context guard** (gym proxy): SGLang `/generate` hard-rejects prompts ≥ context_length;
+  the proxy ends such turns cleanly with `finish_reason="length"` instead of 500-ing.
+- **Contiguity resilience** (`nemo_rl/environments/nemo_gym.py`): a rare non-contiguous turn
+  truncates the episode (dropping the corrupted tail) instead of hard-asserting and stalling the
+  step. Expect occasional `[SWE2-SGLang] WARNING: non-contiguous turn; truncating` lines — benign.
+- **KV-flush window**: during refit, `/flush_cache` may not drain within the historical 60s under
+  high rollout concurrency, logging benign `TimeoutError` storms; set
+  `++policy.generation.sglang_server.flush_cache_timeout_s=300` to widen the window.
+
 ---
 
 ## 6. (Optional) Reproduce the SGLang↔vLLM logprob parity
