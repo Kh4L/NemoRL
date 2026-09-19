@@ -29,6 +29,54 @@ from nemo_rl.models.generation.sglang.config import (
     get_sglang_fault_tolerance_config,
 )
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
+from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
+
+
+@pytest.mark.parametrize("backend", [None, "triton", "flashinfer_trtllm"])
+def test_worker_forwards_explicit_moe_runner_backend(
+    monkeypatch: pytest.MonkeyPatch, backend: str | None
+) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    worker_class = SGLangGenerationWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_class)
+    worker.gpus_per_node = 2
+    worker.num_gpus_per_engine = 2
+    worker.rank = 0
+    worker.base_gpu_id = 0
+    worker.sglang_cfg = {
+        "sglang_cfg": {
+            "model_path": "test/model",
+            "random_seed": 42,
+            "tp_size": 2,
+            "pp_size": 1,
+            "dp_size": 1,
+            "ep_size": 1,
+            "skip_server_warmup": True,
+            "sglang_server_config": {
+                "num_gpus_per_engine": 2,
+                "needs_offload": False,
+                "cpu_weight_backup": False,
+            },
+        }
+    }
+    if backend is not None:
+        worker.sglang_cfg["sglang_cfg"]["moe_runner_backend"] = backend
+    original = deepcopy(worker.sglang_cfg)
+
+    server_args = worker._compute_server_args(
+        dist_init_addr="127.0.0.1:30000",
+        nccl_port=30001,
+        host="127.0.0.1",
+        port=30002,
+    )
+
+    if backend is None:
+        assert "moe_runner_backend" not in server_args
+    else:
+        assert server_args["moe_runner_backend"] == backend
+    assert server_args["model_path"] == "test/model"
+    assert server_args["tp_size"] == 2
+    assert worker.sglang_cfg == original
 
 
 def test_fault_tolerance_defaults_are_centralized_and_disabled():

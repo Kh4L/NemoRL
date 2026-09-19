@@ -1,0 +1,106 @@
+# SWE1 pivot with SGLang. The 128-GPU layout is a scale-out configuration,
+# not a convergence result. Use the separately named quick recipe for smoke tests.
+defaults: grpo_qwen3_30ba3b_thinking_swe1.yaml
+
+grpo:
+  async_grpo:
+    # Collection is asynchronous; each weight update remains a barrier.
+    in_flight_weight_updates: false
+
+policy:
+  tokenizer:
+    # Reuse the model-specific thinking-preserving template from the parent.
+    # The inherited vLLM block supplies only this template; no vLLM engine runs.
+    chat_template: ${policy.generation.vllm_cfg.http_server_serving_chat_kwargs.chat_template}
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  router_replay:
+    # The Gym native /generate adapter does not provide routed-expert traces.
+    enabled: false
+  generation:
+    backend: sglang
+    refit_transport: null
+    use_async_rollouts: true
+    vllm_cfg:
+      enable_vllm_metrics_logger: false
+    sglang_cfg:
+      model_path: ${policy.model_name}
+      dtype: ${policy.precision}
+      context_length: ${policy.max_total_sequence_length}
+      allow_auto_truncate: false
+      tp_size: 2
+      dp_size: 1
+      pp_size: 1
+      ep_size: 1
+      random_seed: 42
+      # The pinned Miles revision does not include the BF16 FlashInfer reload fix.
+      moe_runner_backend: triton
+      max_running_requests: 8
+      mem_fraction_static: 0.6
+      skip_server_warmup: true
+      cuda_graph_backend_prefill: disabled
+      disable_cuda_graph: false
+      quantization:
+        scheme: bf16
+      sglang_server_config:
+        needs_offload: false
+        cpu_weight_backup: false
+        sglang_server_concurrency: 8
+        pause_generation_mode: retract
+        num_gpus: 64
+        num_gpus_per_engine: 2
+      sglang_router_config:
+        use_external_router: false
+        use_distributed_post: true
+        retry_max_retries: 5
+        cb_failure_threshold: 10
+      sglang_http_client_config:
+        max_retries: 3
+      sglang_fault_tolerance_config:
+        use_fault_tolerance: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 8
+
+env:
+  should_use_nemo_gym: true
+  # False retains train_data_step*.jsonl token/mask artifacts in the GRPO driver.
+  should_log_nemo_gym_responses: false
+  should_mask_flagged_samples: true
+  nemo_gym:
+    # Use a run-specific directory, never an unverified old adapter environment.
+    uv_venv_dir: ${oc.env:NRL_GYM_VENV_DIR}
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+    config_paths:
+      - responses_api_models/sglang_model/configs/sglang_model_for_training.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
+    policy_model:
+      responses_api_models:
+        sglang_model:
+          context_length: ${policy.max_total_sequence_length}
+          sglang_chat_template: ${policy.tokenizer.chat_template}
+          sglang_tool_format: hermes
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+          uses_reasoning_parser: true
+    single_step_tool_use_with_argument_comparison_swe:
+      responses_api_agents:
+        tool_simulation_agent:
+          entrypoint: app.py
+          resources_server:
+            type: resources_servers
+            name: swe_pivot_single_step_tool_use_with_argument_comparison_resources_server
+          model_server:
+            type: responses_api_models
+            name: policy_model
+  _override_: true
+
+cluster:
+  num_nodes: 16
+  gpus_per_node: 8

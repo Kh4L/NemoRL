@@ -220,6 +220,9 @@ class SglangSpecificArgs(TypedDict):
     # Legacy MoE flags; superseded by `moe_a2a_backend` in newer SGLang. Kept for back-compat.
     enable_deepep_moe: NotRequired[bool]
     enable_ep_moe: NotRequired[bool]
+    # MoE runner backend (e.g. "triton", "flashinfer_trtllm", or "auto").
+    # Omit to retain SGLang's backend selection; choices are defined upstream.
+    moe_runner_backend: NotRequired[str]
     # Compile the model with torch.compile (experimental).
     enable_torch_compile: NotRequired[bool]
     # Maximum batch size when using torch.compile.

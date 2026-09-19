@@ -1,0 +1,57 @@
+# Three-step integration probe: four training GPUs and two TP2 rollout engines.
+# Requires a separately prepared short-prompt subset of real SWE1 data.
+# This does not reproduce the full-context 128-GPU training configuration.
+defaults: ../../../nemo_gym/grpo_qwen3_30ba3b_thinking_swe1_sglang.yaml
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 4
+  max_num_steps: 3
+  max_num_epochs: 3
+  val_at_start: false
+  val_at_end: false
+  val_period: 0
+
+checkpointing:
+  enabled: false
+
+policy:
+  model_name: ${oc.env:NRL_MODEL_PATH}
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step},${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  refit_buffer_size_gb: 1.0
+  max_total_sequence_length: 8192
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    checkpoint:
+      async_save: false
+  generation:
+    max_new_tokens: 2048
+    sglang_cfg:
+      sglang_server_config:
+        num_gpus: 4
+    colocated:
+      resources:
+        gpus_per_node: 4
+        num_nodes: 1
+
+data:
+  train:
+    data_path: ${oc.env:NRL_SWE1_TRAIN_PATH}
+  validation:
+    data_path: ${oc.env:NRL_SWE1_VALIDATION_PATH}
+
+logger:
+  log_dir: ${oc.env:NRL_RUN_DIR}/logs
+  wandb_enabled: false
+  tensorboard_enabled: true
+
+cluster:
+  num_nodes: 2
+  gpus_per_node: 4
