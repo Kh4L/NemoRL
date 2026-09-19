@@ -159,9 +159,12 @@ Start with the separately named
 [two-node, four-GPU-per-node quick recipe](../../examples/configs/recipes/llm/grpo-qwen3-30ba3b-thinking-swe1-2n4g-megatron-async-gym-sglang-quick.yaml),
 not the inherited 128-GPU scale-out configuration. The quick profile uses four
 Megatron training GPUs (TP2, PP1, CP1, EP4, expert TP1) and four rollout GPUs
-(two TP2 engines), 8192 total tokens / 2048 new tokens, and three steps of four
+(two TP2 engines), 14336 total tokens / 8192 new tokens, and three steps of four
 prompts with four generations each. This is an integration check, not a
-convergence or full-context benchmark. GPU validation is pending.
+convergence or full-context benchmark. This completion budget preserves the
+6144-token prompt budget: the initial native rollout test exhausted the previous
+2048-token completion budget on four of eight unchanged prompts. The larger
+completion budget, three-step training and refit acceptance remain unverified.
 
 Prerequisites:
 
@@ -176,7 +179,8 @@ Prerequisites:
 - This recipe selects **BF16 + `moe_runner_backend: triton`**. The pinned SGLang
   Miles revision is `3003d70f680d41c59d1b7acbf65cb47795dfd19e`; it does not include
   the BF16 FlashInfer TRT-LLM expert-reload fix. Do not silently switch the runner.
-- Prepare an immutable local model snapshot and the original SWE1 pivot JSONL.
+- Prepare an immutable local model snapshot and the placeholder-filled SWE1
+  pivot training split, not the raw downloaded JSONL.
   The model directory must end in its full revision hash. Run preparation and
   training in compute allocations, not on a shared login host.
 
@@ -188,7 +192,7 @@ checkout; set the paths below for your system:
 export NRL_MODEL_REVISION=144afc2f379b542fdd4e85a1fcd5e1f79112d95d
 export NRL_MODEL_PATH=/path/to/model/snapshots/$NRL_MODEL_REVISION
 export NRL_DATASET_REVISION=b90f74f1d0bafeec6d1f1321173f6775ba5bda2e
-export NRL_SWE1_SOURCE=/path/to/original/swe1/val-split.jsonl
+export NRL_SWE1_SOURCE=/path/to/prepared/swe1/train-split.jsonl
 export NRL_PREPARED_DATA=/path/to/new/swe1-smoke-data
 export NRL_GYM_VENV_DIR=/path/to/verified/gym-service-venvs
 export NRL_RUN_DIR=/path/to/new/swe1-smoke-run
@@ -208,10 +212,13 @@ export NRL_SWE1_DATA_RECEIPT=$NRL_PREPARED_DATA/manifest.json
 The tool selects 12 training and four validation rows, without modifying their
 prompts, labels, or routing. Selection uses prompt length and deduplication, not
 reward. It fails if too few complete prompts fit the 6144-token input budget;
-do not truncate examples to force a pass. These subsets come from a validation
-split for integration testing only and must not be used to report held-out
-quality. The manifest records the exact renderer, template, source/split hashes,
-source line numbers, and rendered token counts.
+do not truncate examples to force a pass. Use the prepared training split: only
+three of the 100 cached validation prompts fit this budget with the pinned model
+and renderer. Both integration subsets come from the training split; their names
+match the configuration and do not make them a held-out evaluation. Do not use
+them to report generalization or benchmark quality. The manifest records the
+exact renderer, template, source/split hashes, source line numbers, and rendered
+token counts.
 
 With the two-node Ray cluster already running inside your allocation and all
 worker/service environments prepared, run the fixed acceptance driver:

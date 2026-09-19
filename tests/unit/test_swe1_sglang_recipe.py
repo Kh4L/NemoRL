@@ -62,9 +62,10 @@ def test_quick_recipe_uses_current_sglang_knobs_and_bounded_work(recipe):
     assert (
         sglang["context_length"]
         == recipe["policy"]["max_total_sequence_length"]
-        == 8192
+        == 14336
     )
-    assert generation["max_new_tokens"] == 2048
+    assert generation["max_new_tokens"] == 8192
+    assert sglang["context_length"] - generation["max_new_tokens"] == 6144
     assert sglang["allow_auto_truncate"] is False
     assert sglang["sglang_server_config"]["pause_generation_mode"] == "retract"
     assert not sglang["sglang_fault_tolerance_config"]["use_fault_tolerance"]
