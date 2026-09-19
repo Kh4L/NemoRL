@@ -165,8 +165,24 @@ convergence or full-context benchmark. This completion budget preserves the
 6144-token prompt budget: native rollout tests exhausted a 2048-token completion
 budget on four of eight unchanged prompts and an 8192-token budget on one of
 eight. The latter response was cut off mid-tool-call; the other seven passed
-the rollout checks. The 16384-token completion budget, three-step training and
-refit acceptance remain unverified.
+the rollout checks. At 16384 completion tokens, the native smoke test completed
+all eight unchanged prompts with parsed tool calls and matching finite token
+logprobs; the longest response used 9525 output tokens. The current-source CPU
+gate also passed 600 tests, type checks, and all four service-interpreter checks.
+
+As of September 19, 2026, the bounded integration test also passed on two GB200
+nodes with four GPUs each. Both allocated nodes passed the Megatron,
+async-worker and SGLang import/library checks after correcting the source and
+loader paths. Each of the seven observed selected CUDA library SONAMEs, including
+cuDNN, had a single provider; NVTX was not observed by these probes.
+The corrected bare-metal launcher completed all three training steps with finite
+loss and gradients, positive gradients on steps 1 and 2, and three completed
+training-time refit barriers. The saved Gym payloads contain 16 valid rows per
+step with active training tokens. Original artifact hashes, source checks and
+both-node owned-process cleanup passed; the allocation completed with exit zero.
+This verifies the bounded training/refit path, not 128-GPU scale-out,
+fault recovery, or convergence. The observed rewards are integration results,
+not a benchmark or evidence of learning.
 
 Prerequisites:
 
@@ -178,6 +194,31 @@ Prerequisites:
   additionally use the `vllm` extra, even though generation uses SGLang. Do not
   combine conflicting extras in one environment or reuse an old service
   directory merely because it contains `bin/python`.
+  `NEMO_RL_VENV_DIR` is the parent of actor environments arranged as
+  `<fully-qualified-actor-class>/bin/python`, not a single shared virtual environment.
+  Gym uses a different layout under `NRL_GYM_VENV_DIR`:
+  `<service-type>/<service-name>/.venv`, with both `bin/python` and `bin/activate`.
+  Prepare `responses_api_models/sglang_model`,
+  `responses_api_agents/tool_simulation_agent`, and
+  `resources_servers/single_step_tool_use_with_argument_comparison` there.
+  A flat or actor-style directory does not satisfy Gym's existing-environment check.
+- Verify the actual actor interpreter/module origins and loaded CUDA libraries
+  on both allocated nodes before starting Ray. In reused editable environments,
+  the checked-out Megatron-Bridge package lives under its `src` directory, not
+  the repository root. The validated Megatron environment reused a retained
+  Transformer Engine wheel; this is not a demonstrated fresh-install recipe.
+  Build-only CUDA driver stubs must not appear in runtime loader paths.
+- Do not add one role's `nvidia/cudnn/lib` directory to a shared
+  `LD_LIBRARY_PATH`. The [cuDNN Frontend loader](https://github.com/NVIDIA/cudnn-frontend/blob/v1.25.0/python/cudnn/__init__.py#L200-L238)
+  explicitly opens a library from that path before checking its own package;
+  this can load a second copy after PyTorch loads the role's private cuDNN.
+  Apply the reviewed `CUDA_HOME` and loader settings to the controller and both
+  node launch environments before starting Ray. Verify loaded providers in a
+  separate preflight, retaining the duplicate-library check; the acceptance
+  driver below does not perform that library measurement.
+- With [Ray 2.56.1](https://github.com/ray-project/ray/blob/ray-2.56.1/python/ray/scripts/scripts.py#L1147-L1163),
+  pass `--include-dashboard=false` only to `ray start --head`, not to the worker
+  command using `--address`. Explicit `false` is still rejected on workers.
 - This recipe selects **BF16 + `moe_runner_backend: triton`**. The pinned SGLang
   Miles revision is `3003d70f680d41c59d1b7acbf65cb47795dfd19e`; it does not include
   the BF16 FlashInfer TRT-LLM expert-reload fix. Do not silently switch the runner.
@@ -191,11 +232,13 @@ used for generation. Choose new output and run directories outside the source
 checkout; set the paths below for your system:
 
 ```bash
+unset NEMO_RL_PY_EXECUTABLES_SYSTEM LD_PRELOAD
 export NRL_MODEL_REVISION=144afc2f379b542fdd4e85a1fcd5e1f79112d95d
 export NRL_MODEL_PATH=/path/to/model/snapshots/$NRL_MODEL_REVISION
 export NRL_DATASET_REVISION=b90f74f1d0bafeec6d1f1321173f6775ba5bda2e
 export NRL_SWE1_SOURCE=/path/to/prepared/swe1/train-split.jsonl
 export NRL_PREPARED_DATA=/path/to/new/swe1-smoke-data
+export NEMO_RL_VENV_DIR=/path/to/verified/actor-venvs
 export NRL_GYM_VENV_DIR=/path/to/verified/gym-service-venvs
 export NRL_RUN_DIR=/path/to/new/swe1-smoke-run
 export NRL_MEGATRON_CHECKPOINT_DIR=/path/to/writable/model-conversion-cache
@@ -210,6 +253,28 @@ export NRL_SWE1_TRAIN_PATH=$NRL_PREPARED_DATA/train.jsonl
 export NRL_SWE1_VALIDATION_PATH=$NRL_PREPARED_DATA/validation.jsonl
 export NRL_SWE1_DATA_RECEIPT=$NRL_PREPARED_DATA/manifest.json
 ```
+
+For the verified CUDA 13 package layout used in the import checks, the shared
+loader path contains only the CUDA and NVSHMEM directories below. The selected
+package versions and library hashes must match the actor environments. Apply
+these settings to both node launch environments and the controller before Ray
+starts; do not append an inherited loader path or another role's cuDNN directory:
+
+```bash
+unset NEMO_RL_PY_EXECUTABLES_SYSTEM LD_PRELOAD
+export NRL_SHARED_CUDA_SITE=/path/to/verified/cuda/site-packages
+export CUDA_HOME=/path/to/verified/cuda-toolkit
+export TORCH_CUDA_ARCH_LIST="10.0"  # GB200; select the target architecture for your GPUs.
+export LD_LIBRARY_PATH="$NRL_SHARED_CUDA_SITE/nvidia/cu13/lib:$NRL_SHARED_CUDA_SITE/nvidia/nvshmem/lib"
+```
+
+The system-interpreter override would bypass the separate actor environments;
+an inherited loader preload would invalidate the checked library selection.
+
+Megatron requires `TORCH_CUDA_ARCH_LIST` in the driver environment even when
+the worker packages are already built. The example targets
+[GB200 compute capability 10.0](https://developer.nvidia.com/cuda/gpus); apply it
+before starting the controller and Ray nodes, not only during environment builds.
 
 The tool selects 12 training and four validation rows, without modifying their
 prompts, labels, or routing. Selection uses prompt length and deduplication, not
