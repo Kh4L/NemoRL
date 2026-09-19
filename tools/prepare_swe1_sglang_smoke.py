@@ -20,12 +20,36 @@ import inspect
 import json
 import subprocess
 from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from omegaconf import OmegaConf
 
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+
+
+@dataclass
+class SmokeDataSplit:
+    """Provenance for one unmodified subset of the source rows."""
+
+    path: str
+    sha256: str
+    num_rows: int
+    source_lines: list[int]
+    input_token_counts: list[int]
+
+
+def validate_template_kwargs(value: object) -> dict[str, Any]:
+    """Require a keyword mapping without coercing or dropping invalid keys."""
+    if not isinstance(value, dict):
+        raise ValueError("chat_template_kwargs must be a string-keyed mapping")
+    result: dict[str, Any] = {}
+    for key, option in value.items():
+        if not isinstance(key, str):
+            raise ValueError("chat_template_kwargs must be a string-keyed mapping")
+        result[key] = option
+    return result
 
 
 def file_sha256(path: Path) -> str:
@@ -127,8 +151,10 @@ def main() -> None:
     register_omegaconf_resolvers()
     config = load_config(args.config)
     template = config.policy.tokenizer.chat_template
-    template_kwargs = OmegaConf.to_container(
-        config.policy.tokenizer.chat_template_kwargs, resolve=True
+    template_kwargs = validate_template_kwargs(
+        OmegaConf.to_container(
+            config.policy.tokenizer.chat_template_kwargs, resolve=True
+        )
     )
     context_length = config.policy.max_total_sequence_length
     max_new_tokens = config.policy.generation.max_new_tokens
@@ -177,6 +203,7 @@ def main() -> None:
     gym_commit = subprocess.check_output(
         ["git", "-C", str(gym_root), "rev-parse", "HEAD"], text=True
     ).strip()
+    splits: dict[str, dict[str, Any]] = {}
     receipt = {
         "kind": "swe1-smoke-data-v1",
         "scope": "integration-only; original rows preserved; no quality/convergence claim",
@@ -194,7 +221,7 @@ def main() -> None:
             "max_new_tokens": max_new_tokens,
         },
         "selection": counters,
-        "splits": {},
+        "splits": splits,
     }
     args.output_dir.mkdir(parents=True, exist_ok=False)
     for split, rows in (
@@ -205,13 +232,15 @@ def main() -> None:
         with path.open("xb") as stream:
             for _, raw_line, _ in rows:
                 stream.write(raw_line if raw_line.endswith(b"\n") else raw_line + b"\n")
-        receipt["splits"][split] = {
-            "path": str(path.resolve()),
-            "sha256": file_sha256(path),
-            "num_rows": len(rows),
-            "source_lines": [row[0] for row in rows],
-            "input_token_counts": [row[2] for row in rows],
-        }
+        splits[split] = asdict(
+            SmokeDataSplit(
+                path=str(path.resolve()),
+                sha256=file_sha256(path),
+                num_rows=len(rows),
+                source_lines=[row[0] for row in rows],
+                input_token_counts=[row[2] for row in rows],
+            )
+        )
     (args.output_dir / "manifest.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps(receipt, indent=2))
 

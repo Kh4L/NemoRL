@@ -5,7 +5,25 @@ from pathlib import Path
 
 import pytest
 
-from tools.prepare_swe1_sglang_smoke import file_sha256, select_rows
+from tools.prepare_swe1_sglang_smoke import (
+    file_sha256,
+    select_rows,
+    validate_template_kwargs,
+)
+
+
+def test_template_kwargs_preserves_valid_options_without_mutation():
+    options = {"enable_thinking": True, "truncate_history_thinking": False}
+    actual = validate_template_kwargs(options)
+    assert actual == options
+    assert actual is not options
+    assert validate_template_kwargs({}) == {}
+
+
+@pytest.mark.parametrize("value", [None, [], "enable_thinking", {1: True}])
+def test_template_kwargs_rejects_non_mapping_or_non_string_keys(value):
+    with pytest.raises(ValueError, match="string-keyed mapping"):
+        validate_template_kwargs(value)
 
 
 def write_rows(path: Path, prompt_lengths: list[int]) -> list[bytes]:
