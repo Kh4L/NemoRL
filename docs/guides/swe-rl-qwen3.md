@@ -147,6 +147,99 @@ uv run --frozen ./examples/nemo_gym/run_grpo_nemo_gym.py \
 
 Stage 1 runs with 16 training nodes + 8 generation nodes, `num_prompts_per_step=64`, `num_generations_per_prompt=8`, `train_global_batch_size=512`, TP=2. The best checkpoint (`step230`) is converted to HF format and used as the starting point for Stage 2.
 
+### SWE1 with SGLang: bounded integration starter
+
+The [SGLang SWE1 configuration](../../examples/nemo_gym/grpo_qwen3_30ba3b_thinking_swe1_sglang.yaml)
+uses the native NeMo-Gym SGLang adapter, exact generation token IDs/logprobs,
+and asynchronous collection with **barrier weight updates**. It reuses the
+thinking-preserving template above. It does not provide routed-expert replay or
+worker-owned token capture. The results above are not results from this backend.
+
+Start with the separately named
+[two-node, four-GPU-per-node quick recipe](../../examples/configs/recipes/llm/grpo-qwen3-30ba3b-thinking-swe1-2n4g-megatron-async-gym-sglang-quick.yaml),
+not the inherited 128-GPU scale-out configuration. The quick profile uses four
+Megatron training GPUs (TP2, PP1, CP1, EP4, expert TP1) and four rollout GPUs
+(two TP2 engines), 8192 total tokens / 2048 new tokens, and three steps of four
+prompts with four generations each. This is an integration check, not a
+convergence or full-context benchmark. GPU validation is pending.
+
+Prerequisites:
+
+- Use a clean checkout and its exact recursive submodule commits. The Gym
+  submodule must include `responses_api_models/sglang_model`; a stock Gym
+  checkout without that adapter is not interchangeable.
+- Prepare separate controller, SGLang, Megatron, and Gym service environments
+  from the checked-out lockfiles. The current async collector and replay buffer
+  additionally use the `vllm` extra, even though generation uses SGLang. Do not
+  combine conflicting extras in one environment or reuse an old service
+  directory merely because it contains `bin/python`.
+- This recipe selects **BF16 + `moe_runner_backend: triton`**. The pinned SGLang
+  Miles revision is `3003d70f680d41c59d1b7acbf65cb47795dfd19e`; it does not include
+  the BF16 FlashInfer TRT-LLM expert-reload fix. Do not silently switch the runner.
+- Prepare an immutable local model snapshot and the original SWE1 pivot JSONL.
+  The model directory must end in its full revision hash. Run preparation and
+  training in compute allocations, not on a shared login host.
+
+Select a small integration-only subset with the same native adapter renderer
+used for generation. Choose new output and run directories outside the source
+checkout; set the paths below for your system:
+
+```bash
+export NRL_MODEL_REVISION=144afc2f379b542fdd4e85a1fcd5e1f79112d95d
+export NRL_MODEL_PATH=/path/to/model/snapshots/$NRL_MODEL_REVISION
+export NRL_DATASET_REVISION=b90f74f1d0bafeec6d1f1321173f6775ba5bda2e
+export NRL_SWE1_SOURCE=/path/to/original/swe1/val-split.jsonl
+export NRL_PREPARED_DATA=/path/to/new/swe1-smoke-data
+export NRL_GYM_VENV_DIR=/path/to/verified/gym-service-venvs
+export NRL_RUN_DIR=/path/to/new/swe1-smoke-run
+export NRL_MEGATRON_CHECKPOINT_DIR=/path/to/writable/model-conversion-cache
+export NEMO_GYM_EXTRA_ROOTS=$PWD/3rdparty/Gym-workspace/Gym
+
+uv run --frozen --extra nemo_gym tools/prepare_swe1_sglang_smoke.py \
+  --source "$NRL_SWE1_SOURCE" --output-dir "$NRL_PREPARED_DATA" \
+  --model-path "$NRL_MODEL_PATH" --model-revision "$NRL_MODEL_REVISION" \
+  --dataset-revision "$NRL_DATASET_REVISION"
+
+export NRL_SWE1_TRAIN_PATH=$NRL_PREPARED_DATA/train.jsonl
+export NRL_SWE1_VALIDATION_PATH=$NRL_PREPARED_DATA/validation.jsonl
+export NRL_SWE1_DATA_RECEIPT=$NRL_PREPARED_DATA/manifest.json
+```
+
+The tool selects 12 training and four validation rows, without modifying their
+prompts, labels, or routing. Selection uses prompt length and deduplication, not
+reward. It fails if too few complete prompts fit the 6144-token input budget;
+do not truncate examples to force a pass. These subsets come from a validation
+split for integration testing only and must not be used to report held-out
+quality. The manifest records the exact renderer, template, source/split hashes,
+source line numbers, and rendered token counts.
+
+With the two-node Ray cluster already running inside your allocation and all
+worker/service environments prepared, run the fixed acceptance driver:
+
+```bash
+export RAY_ADDRESS=auto
+bash tests/test_suites/llm/grpo-qwen3-30ba3b-thinking-swe1-2n4g-megatron-async-gym-sglang-quick.sh
+```
+
+For an explicitly prepared, read-only controller, set `NRL_CONTROLLER_PYTHON`
+to its interpreter; the driver then uses offline, no-sync execution. This does
+not replace the separate worker environments configured by `NEMO_RL_VENV_DIR`
+and `NRL_GYM_VENV_DIR`.
+
+Pinning `NEMO_GYM_EXTRA_ROOTS` is important when reusing an interpreter with older
+editable installs: checking `nemo_gym.__file__` alone does not establish which
+model/resource components Python loads. The preparation and acceptance checks
+also verify the actual adapter sources.
+
+Success requires three completed steps with finite loss/gradients, active
+training tokens and at least one positive gradient norm; at least two completed
+refit barriers; and valid per-step Gym token, loss-mask and logprob artifacts.
+The evidence directory preserves the command, source/model/data provenance,
+original logs and TensorBoard events, conflict-checked metrics, exit codes,
+`validation.json`, and file hashes. Refit timings prove completion of the
+trainer's blocking refit path, not independently queried engine weight versions.
+An exit-zero process, dry run, or CPU test result alone is not GPU validation.
+
 ### Stage 2 — SWE2 (end-to-end agentic)
 
 Multi-turn OpenHands agent in a sandbox. The environment swaps in the `swe_agents` config and sets the agent budget:

@@ -16,6 +16,7 @@
 
 import argparse
 import hashlib
+import inspect
 import json
 import subprocess
 from collections.abc import Callable
@@ -110,6 +111,18 @@ def main() -> None:
     from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
     from nemo_gym.server_utils import BaseServerConfig, ServerClient
     from responses_api_models.sglang_model.app import SGLangModel, SGLangModelConfig
+    from responses_api_models.vllm_model.app import VLLMModel, VLLMModelConfig
+
+    gym_root = Path(nemo_gym.__file__).resolve().parent.parent
+    expected_gym = Path(__file__).resolve().parents[1] / "3rdparty/Gym-workspace/Gym"
+    if gym_root != expected_gym.resolve() or any(
+        not Path(inspect.getfile(model_class)).resolve().is_relative_to(gym_root)
+        for model_class in (SGLangModel, SGLangModelConfig, VLLMModel, VLLMModelConfig)
+    ):
+        raise RuntimeError(
+            "Gym core and model components must come from the pinned submodule; "
+            "set NEMO_GYM_EXTRA_ROOTS to that checkout before starting Python"
+        )
 
     register_omegaconf_resolvers()
     config = load_config(args.config)
@@ -161,7 +174,6 @@ def main() -> None:
         max_prompt_tokens=prompt_budget,
         prompt_token_ids=prompt_token_ids,
     )
-    gym_root = Path(nemo_gym.__file__).resolve().parent.parent
     gym_commit = subprocess.check_output(
         ["git", "-C", str(gym_root), "rev-parse", "HEAD"], text=True
     ).strip()

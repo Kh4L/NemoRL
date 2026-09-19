@@ -18,16 +18,45 @@ import copy
 import json
 import subprocess
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
 from tests.swe1_sglang_checks import (
+    component_imports,
     sha256,
     source_identity,
     validate_data_receipt,
     validate_gym_rows,
     validate_training,
 )
+
+
+@pytest.mark.parametrize(
+    "stale_component", [None, "responses_api_models.vllm_model.app"]
+)
+def test_component_identity_rejects_old_adapter_with_current_gym_core(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale_component: str | None
+) -> None:
+    project = tmp_path / "current"
+    observed = []
+
+    def load(name: str) -> ModuleType:
+        observed.append(name)
+        root = project if name == "nemo_rl" else project / "3rdparty/Gym-workspace/Gym"
+        if name == stale_component:
+            root = tmp_path / "old-gym"
+        module = ModuleType(name)
+        module.__file__ = str(root / name.replace(".", "/") / "__init__.py")
+        return module
+
+    monkeypatch.setattr("tests.swe1_sglang_checks.import_module", load)
+    if stale_component:
+        with pytest.raises(ValueError, match="outside the current source"):
+            component_imports(project)
+    else:
+        assert len(component_imports(project)) == 7
+    assert observed[:2] == ["nemo_rl", "nemo_gym"]
 
 
 def gym_row(index: int) -> dict:

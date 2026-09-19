@@ -53,6 +53,9 @@ mkdir "$NRL_RUN_DIR"
 mkdir "$NRL_RUN_DIR/logs"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/3rdparty/Gym-workspace/Gym:${PYTHONPATH:-}"
+# Gym reorders component search roots at import time. Pin components as well as
+# its core package when reusing an interpreter with older editable installs.
+export NEMO_GYM_EXTRA_ROOTS="$PROJECT_ROOT/3rdparty/Gym-workspace/Gym"
 cd "$PROJECT_ROOT"
 
 if [[ -n "${NRL_CONTROLLER_PYTHON:-}" ]]; then
@@ -62,7 +65,7 @@ if [[ -n "${NRL_CONTROLLER_PYTHON:-}" ]]; then
     # the recipe's NRL_GYM_VENV_DIR; this is not a SYSTEM-site-packages shortcut.
     RUN=(uv run --offline --no-project --no-sync --python "$NRL_CONTROLLER_PYTHON" python)
 else
-    RUN=(uv run --frozen python)
+    RUN=(uv run --frozen --extra nemo_gym python)
 fi
 CHECK=("${RUN[@]}" tests/swe1_sglang_checks.py)
 finish() {

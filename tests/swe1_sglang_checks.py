@@ -285,6 +285,30 @@ def validate_data_receipt(
             raise ValueError(f"Prepared {name} row count mismatch/insufficient rows")
 
 
+def component_imports(project: Path) -> dict[str, str]:
+    """Check Gym components as well as its core when reusing editable installs."""
+    gym_root = project / "3rdparty/Gym-workspace/Gym"
+    imports = {}
+    # Match the trainer's order: Gym augments sys.path during its import.
+    for name, root in (
+        ("nemo_rl", project / "nemo_rl"),
+        ("nemo_gym", gym_root / "nemo_gym"),
+        ("nemo_gym.openai_utils", gym_root / "nemo_gym"),
+        ("responses_api_models.sglang_model.app", gym_root),
+        ("responses_api_models.vllm_model.app", gym_root),
+        ("responses_api_agents.tool_simulation_agent.app", gym_root),
+        (
+            "resources_servers.single_step_tool_use_with_argument_comparison.app",
+            gym_root,
+        ),
+    ):
+        module = import_module(name)
+        if not Path(module.__file__).resolve().is_relative_to(root.resolve()):
+            raise ValueError(f"{module.__name__} imported outside the current source")
+        imports[name] = module.__file__
+    return imports
+
+
 def preflight(project: Path) -> dict:
     """Read source/assets/imports and attach to an existing Ray cluster only."""
     identity = source_identity(project)
@@ -318,16 +342,7 @@ def preflight(project: Path) -> dict:
 
     import ray
 
-    # Match the trainer's order: Gym augments sys.path during its import.
-    nemo_rl = import_module("nemo_rl")
-    nemo_gym = import_module("nemo_gym")
-
-    for module, root in (
-        (nemo_rl, project / "nemo_rl"),
-        (nemo_gym, project / "3rdparty/Gym-workspace/Gym/nemo_gym"),
-    ):
-        if not Path(module.__file__).resolve().is_relative_to(root.resolve()):
-            raise ValueError(f"{module.__name__} imported outside the current source")
+    imports = component_imports(project)
     from omegaconf import OmegaConf
 
     from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
@@ -417,7 +432,7 @@ def preflight(project: Path) -> dict:
         "source": identity,
         "python": sys.executable,
         "controller_versions": versions,
-        "imports": {"nemo_rl": nemo_rl.__file__, "nemo_gym": nemo_gym.__file__},
+        "imports": imports,
         "worker_venv_root": os.environ.get("NEMO_RL_VENV_DIR"),
         "gym_venv_root": os.environ["NRL_GYM_VENV_DIR"],
         "image_ref": os.environ.get("NRL_IMAGE_REF"),
