@@ -159,12 +159,14 @@ Start with the separately named
 [two-node, four-GPU-per-node quick recipe](../../examples/configs/recipes/llm/grpo-qwen3-30ba3b-thinking-swe1-2n4g-megatron-async-gym-sglang-quick.yaml),
 not the inherited 128-GPU scale-out configuration. The quick profile uses four
 Megatron training GPUs (TP2, PP1, CP1, EP4, expert TP1) and four rollout GPUs
-(two TP2 engines), 14336 total tokens / 8192 new tokens, and three steps of four
+(two TP2 engines), 22528 total tokens / 16384 new tokens, and three steps of four
 prompts with four generations each. This is an integration check, not a
 convergence or full-context benchmark. This completion budget preserves the
-6144-token prompt budget: the initial native rollout test exhausted the previous
-2048-token completion budget on four of eight unchanged prompts. The larger
-completion budget, three-step training and refit acceptance remain unverified.
+6144-token prompt budget: native rollout tests exhausted a 2048-token completion
+budget on four of eight unchanged prompts and an 8192-token budget on one of
+eight. The latter response was cut off mid-tool-call; the other seven passed
+the rollout checks. The 16384-token completion budget, three-step training and
+refit acceptance remain unverified.
 
 Prerequisites:
 

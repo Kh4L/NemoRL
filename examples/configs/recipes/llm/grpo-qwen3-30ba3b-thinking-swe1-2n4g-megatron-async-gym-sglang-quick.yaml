@@ -22,7 +22,7 @@ policy:
   logprob_batch_size: 1
   refit_buffer_size_gb: 1.0
   # Keep 6144 prompt tokens while allowing the thinking model to finish.
-  max_total_sequence_length: 14336
+  max_total_sequence_length: 22528
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   megatron_cfg:
     tensor_model_parallel_size: 2
@@ -33,7 +33,7 @@ policy:
     checkpoint:
       async_save: false
   generation:
-    max_new_tokens: 8192
+    max_new_tokens: 16384
     sglang_cfg:
       sglang_server_config:
         num_gpus: 4
