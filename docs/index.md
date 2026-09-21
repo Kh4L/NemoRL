@@ -312,6 +312,8 @@ guides/lora.md
 guides/cispo.md
 guides/prorlv2.md
 guides/swe-rl-qwen3.md
+recipes/swe1-sglang/README.md
+recipes/swe1-sglang/VALIDATION.md
 guides/grpo.md
 guides/ppo.md
 guides/grpo-deepscaler.md

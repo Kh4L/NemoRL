@@ -1,0 +1,7 @@
+# Strict key=value data; never source this file as shell code.
+FORMAT_VERSION=1
+NEMO_URL=https://github.com/Kh4L/NemoRL.git
+NEMO_RUNTIME=e4df35ba3ab3c20906335fa7ff978b9766778179
+NEMO_DOCS=9271c3a9718127d02c1c30ede3557c6aee3d95ec
+GYM_URL=https://github.com/Kh4L/NemoGym.git
+GYM_COMMIT=ea5a37ea8b78a986cdb2e670b14012cd3981df03
