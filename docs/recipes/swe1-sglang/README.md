@@ -5,10 +5,6 @@ Qwen3-30B-A3B-Thinking-2507. Megatron trains the policy; SGLang generates
 responses. Collection is asynchronous, while weight updates use blocking refit
 barriers.
 
-**Publication candidate:** the instructions below require the pinned source
-commits to be published in the designated public forks. Their inclusion here
-does not mean those commits are already available or approved for release.
-
 The bounded recipe completed three training steps on **two GB200 nodes with
 four GPUs each**, with two positive gradient norms and three training-time
 refits. See [VALIDATION.md](VALIDATION.md) for the measured result and limits.
@@ -41,7 +37,7 @@ the inherited 128-GPU configuration or run a copied YAML from another directory.
 
 ## 1. Restore the pinned source
 
-After publication, use Bash, Git, a SHA-256 utility and network access to the
+Use Bash, Git, a SHA-256 utility and network access to the
 designated public repositories. First obtain this guide without initializing
 its submodules; the bootstrap then creates a separate, pinned runtime checkout:
 
@@ -57,7 +53,7 @@ bash scripts/checkout_sources.sh /absolute/new/NeMo-RL docs
 cd /absolute/new/NeMo-RL
 ```
 
-The source locations designated for publication are `https://github.com/Kh4L/NemoRL.git`
+The public source locations are `https://github.com/Kh4L/NemoRL.git`
 and `https://github.com/Kh4L/NemoGym.git`. The bootstrap fetches the exact NeMo
 commit, verifies its Gym gitlink against the lock, and sets that checkout's Gym
 submodule URL to the designated fork before recursive initialization. It does

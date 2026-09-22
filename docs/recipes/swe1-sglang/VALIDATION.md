@@ -2,9 +2,6 @@
 
 [Recipe and setup](README.md)
 
-This publication-candidate summary describes a completed integration run; it
-does not claim that the companion source commits are already publicly available.
-
 On September 19, 2026, the native SWE1/SGLang recipe completed three training
 steps on two GB200 nodes with four GPUs each. Megatron training used one node;
 SGLang generation used the other. The allocation completed with exit zero in
@@ -61,8 +58,8 @@ guide; this summary is not a portable replay of the original environment.
 | Nemotron-RL-Super-Training-Blends dataset | `b90f74f1d0bafeec6d1f1321173f6775ba5bda2e` |
 
 The documentation follow-up changes only `docs/guides/swe-rl-qwen3.md` relative
-to the tested runtime. Use the accompanying `SOURCES.lock` and bootstrap after
-the designated public source refs are published; do not infer equivalent
+to the tested runtime. Use the accompanying `SOURCES.lock` and bootstrap;
+do not infer equivalent
 behavior from a newer fork or upstream commit.
 
 ## Limits
